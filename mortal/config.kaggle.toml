@@ -40,7 +40,10 @@ games = 2000
 log_dir = '/kaggle/working/mortal_outputs/test_play'
 
 [dataset]
-globs = ['/kaggle/input/mortal-1v3-data/**/*.json.gz']
+globs = [
+    '/kaggle/input/mortal-1v3-data/**/*.json.gz',
+    '/kaggle/working/mortal_outputs/1v3_pretrain_restart/**/*.json.gz',
+]
 file_index = '/kaggle/working/mortal_outputs/1v3_pretrain_restart_file_index.pth'
 rebuild_file_index = true
 modified_after = ''
@@ -82,6 +85,8 @@ candidate_max_avg_rank = 2.5
 confirm_games = 8000
 confirm_min_avg_pt = 1.0
 confirm_max_avg_rank = 2.49
+confirm_compare_best = true
+confirm_min_delta_best_pt = 0.25
 metric = 'joint'
 patience = 2
 lr_factor = 0.5
@@ -151,7 +156,7 @@ eval_log_dir = '/kaggle/working/mortal_outputs/1v3_eval_pretrain_restart'
 [1v3.challenger]
 device = 'cuda:0'
 name = 'mortal'
-state_file = 'local_models/mortal_pretrain_restart.pth'
+state_file = 'local_models/best_pretrain_restart.pth'
 stochastic_latent = false
 enable_compile = true
 enable_amp = true

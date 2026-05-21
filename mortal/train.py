@@ -92,6 +92,8 @@ def train():
     confirm_games = adaptive_config.get('confirm_games', 0)
     confirm_min_avg_pt = adaptive_config.get('confirm_min_avg_pt', 1.0)
     confirm_max_avg_rank = adaptive_config.get('confirm_max_avg_rank', 2.49)
+    confirm_compare_best = adaptive_config.get('confirm_compare_best', True)
+    confirm_min_delta_best_pt = adaptive_config.get('confirm_min_delta_best_pt', 0.25)
     adaptive_metric = adaptive_config.get('metric', 'joint').lower()
     adaptive_patience = adaptive_config.get('patience', 2)
     adaptive_lr_factor = adaptive_config.get('lr_factor', 0.5)
@@ -113,6 +115,46 @@ def train():
     if candidate_enabled:
         if confirm_games < 0 or confirm_games % 4 != 0:
             raise ValueError('adaptive confirm_games must be non-negative and divisible by 4')
+        if confirm_min_delta_best_pt < 0:
+            raise ValueError('adaptive confirm_min_delta_best_pt must be non-negative')
+
+    def static_glob_root(pattern):
+        abs_pattern = path.abspath(pattern)
+        parts = []
+        for part in abs_pattern.split(path.sep):
+            if any(char in part for char in '*?['):
+                break
+            parts.append(part)
+        if not parts:
+            return path.abspath(path.sep)
+        return path.normcase(path.normpath(path.sep.join(parts)))
+
+    def is_within(child, parent):
+        child = path.normcase(path.abspath(child))
+        parent = path.normcase(path.abspath(parent))
+        try:
+            return path.commonpath([child, parent]) == parent
+        except ValueError:
+            return False
+
+    def log_dir_overlaps_dataset(log_dir):
+        return any(
+            is_within(log_dir, static_glob_root(pattern))
+            for pattern in config['dataset']['globs']
+        )
+
+    if not online:
+        protected_log_dirs = [
+            ('test_play.log_dir', config['test_play']['log_dir']),
+        ]
+        if config.get('1v3', {}).get('eval_log_dir'):
+            protected_log_dirs.append(('1v3.eval_log_dir', config['1v3']['eval_log_dir']))
+        for name, log_dir in protected_log_dirs:
+            if log_dir_overlaps_dataset(log_dir):
+                raise RuntimeError(
+                    f'{name} {log_dir!r} overlaps dataset.globs; '
+                    'evaluation logs must stay outside the training dataset'
+                )
 
     mortal = Brain(version=version, **config['resnet']).to(device)
     dqn = DQN(version=version, **dqn_config).to(device)
@@ -146,7 +188,9 @@ def train():
             'candidate: '
             f'quick rank<={candidate_max_avg_rank}, quick pt>={candidate_min_avg_pt}, '
             f'confirm_games={confirm_games}, '
-            f'confirm rank<={confirm_max_avg_rank}, confirm pt>={confirm_min_avg_pt}'
+            f'confirm rank<={confirm_max_avg_rank}, confirm pt>={confirm_min_avg_pt}, '
+            f'compare_best={confirm_compare_best}, '
+            f'confirm_min_delta_best_pt={confirm_min_delta_best_pt}'
         )
     logging.info(f'mortal params: {parameter_count(mortal):,}')
     logging.info(f'dqn params: {parameter_count(dqn):,}')
@@ -450,9 +494,23 @@ def train():
             )
 
         def candidate_confirm_pass(avg_pt, avg_rank):
+            required_avg_pt = confirm_min_avg_pt
+            if confirm_compare_best:
+                required_avg_pt = max(
+                    required_avg_pt,
+                    best_perf['avg_pt'] + confirm_min_delta_best_pt,
+                )
             return (
-                avg_pt >= confirm_min_avg_pt
+                avg_pt >= required_avg_pt
                 and avg_rank <= confirm_max_avg_rank
+            )
+
+        def candidate_required_confirm_avg_pt():
+            if not confirm_compare_best:
+                return confirm_min_avg_pt
+            return max(
+                confirm_min_avg_pt,
+                best_perf['avg_pt'] + confirm_min_delta_best_pt,
             )
 
         def adaptive_lr_at_floor():
@@ -575,8 +633,15 @@ def train():
                     })
                     logging.info(f'confirm avg rank: {confirm_stat.avg_rank:.6}')
                     logging.info(f'confirm avg pt: {confirm_avg_pt:.6}')
+                    required_confirm_avg_pt = candidate_required_confirm_avg_pt()
+                    logging.info(
+                        'confirm required: '
+                        f'pt >= {required_confirm_avg_pt:.6}, '
+                        f'rank <= {confirm_max_avg_rank:.6}'
+                    )
                     writer.add_scalar('confirm_play/avg_ranking', confirm_stat.avg_rank, steps)
                     writer.add_scalar('confirm_play/avg_pt', confirm_avg_pt, steps)
+                    writer.add_scalar('confirm_play/required_avg_pt', required_confirm_avg_pt, steps)
                     writer.add_scalars('confirm_play/ranking', {
                         '1st': confirm_stat.rank_1_rate,
                         '2nd': confirm_stat.rank_2_rate,
@@ -601,7 +666,8 @@ def train():
                         save_checkpoint()
                         logging.info(
                             'candidate rejected by confirmation, '
-                            f'pt: {confirm_avg_pt:.4}, rank: {confirm_stat.avg_rank:.4}'
+                            f'pt: {confirm_avg_pt:.4} / {required_confirm_avg_pt:.4}, '
+                            f'rank: {confirm_stat.avg_rank:.4} / {confirm_max_avg_rank:.4}'
                         )
                 else:
                     logging.info('candidate confirmation is disabled; best was not promoted')
