@@ -20,7 +20,7 @@ def main():
     conv_channels = config['resnet']['conv_channels']
 
     mortal = Brain(version=version, num_blocks=num_blocks, conv_channels=conv_channels).to(device).eval()
-    dqn = DQN(version=version).to(device)
+    dqn = DQN(version=version, **config.get('dqn', {})).to(device)
     if config['online']['enable_compile']:
         mortal.compile()
         dqn.compile()

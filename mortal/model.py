@@ -194,32 +194,99 @@ class AuxNet(nn.Module):
     def forward(self, x):
         return self.net(x).split(self.dims, dim=-1)
 
+def _build_activation(name: str):
+    match name.lower():
+        case 'relu':
+            return nn.ReLU(inplace=True)
+        case 'mish':
+            return nn.Mish(inplace=True)
+        case 'gelu':
+            return nn.GELU()
+        case 'silu' | 'swish':
+            return nn.SiLU(inplace=True)
+        case _:
+            raise ValueError(f'Unexpected activation {name}')
+
+def _build_mlp(in_features, out_features, *, hidden_size, num_layers, activation, dropout):
+    layers = []
+    last_size = in_features
+    for _ in range(num_layers):
+        layers.append(nn.Linear(last_size, hidden_size))
+        layers.append(_build_activation(activation))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        last_size = hidden_size
+    layers.append(nn.Linear(last_size, out_features))
+    return nn.Sequential(*layers)
+
 class DQN(nn.Module):
-    def __init__(self, *, version=1):
+    def __init__(
+        self,
+        *,
+        version=1,
+        head='legacy',
+        hidden_size=512,
+        num_layers=2,
+        activation='mish',
+        dropout=0.,
+    ):
         super().__init__()
         self.version = version
-        match version:
-            case 1:
-                self.v_head = nn.Linear(512, 1)
-                self.a_head = nn.Linear(512, ACTION_SPACE)
-            case 2 | 3:
-                hidden_size = 512 if version == 2 else 256
-                self.v_head = nn.Sequential(
-                    nn.Linear(1024, hidden_size),
-                    nn.Mish(inplace=True),
-                    nn.Linear(hidden_size, 1),
-                )
-                self.a_head = nn.Sequential(
-                    nn.Linear(1024, hidden_size),
-                    nn.Mish(inplace=True),
-                    nn.Linear(hidden_size, ACTION_SPACE),
-                )
-            case 4:
-                self.net = nn.Linear(1024, 1 + ACTION_SPACE)
-                nn.init.constant_(self.net.bias, 0)
+        self.head = head
+        if version not in (1, 2, 3, 4):
+            raise ValueError(f'Unexpected version {self.version}')
+
+        if head in ('legacy', 'linear'):
+            match version:
+                case 1:
+                    self.v_head = nn.Linear(512, 1)
+                    self.a_head = nn.Linear(512, ACTION_SPACE)
+                case 2 | 3:
+                    legacy_hidden_size = 512 if version == 2 else 256
+                    self.v_head = nn.Sequential(
+                        nn.Linear(1024, legacy_hidden_size),
+                        nn.Mish(inplace=True),
+                        nn.Linear(legacy_hidden_size, 1),
+                    )
+                    self.a_head = nn.Sequential(
+                        nn.Linear(1024, legacy_hidden_size),
+                        nn.Mish(inplace=True),
+                        nn.Linear(legacy_hidden_size, ACTION_SPACE),
+                    )
+                case 4:
+                    self.net = nn.Linear(1024, 1 + ACTION_SPACE)
+                    nn.init.constant_(self.net.bias, 0)
+            return
+
+        if head != 'mlp_dueling':
+            raise ValueError(f'Unexpected DQN head {head}')
+        if num_layers < 0:
+            raise ValueError('num_layers must be non-negative')
+        if dropout < 0:
+            raise ValueError('dropout must be non-negative')
+
+        in_features = 512 if version == 1 else 1024
+        self.v_head = _build_mlp(
+            in_features,
+            1,
+            hidden_size = hidden_size,
+            num_layers = num_layers,
+            activation = activation,
+            dropout = dropout,
+        )
+        self.a_head = _build_mlp(
+            in_features,
+            ACTION_SPACE,
+            hidden_size = hidden_size,
+            num_layers = num_layers,
+            activation = activation,
+            dropout = dropout,
+        )
+        nn.init.constant_(self.v_head[-1].bias, 0)
+        nn.init.constant_(self.a_head[-1].bias, 0)
 
     def forward(self, phi, mask):
-        if self.version == 4:
+        if self.head in ('legacy', 'linear') and self.version == 4:
             v, a = self.net(phi).split((1, ACTION_SPACE), dim=-1)
         else:
             v = self.v_head(phi)

@@ -1,20 +1,83 @@
 import prelude
 
+import argparse
 import numpy as np
 import torch
 import secrets
 import os
+from os import path
 from model import Brain, DQN
 from engine import MortalEngine
 from libriichi.arena import OneVsThree
+from common import load_torch_state
 from config import config
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--mode',
+        choices=('eval', 'train-data'),
+        help='eval writes to eval_log_dir; train-data writes to log_dir for training data generation',
+    )
+    parser.add_argument('--log-dir', help='override the selected log directory')
+    parser.add_argument('--challenger-state-file', help='override [1v3.challenger].state_file')
+    parser.add_argument('--games', type=int, help='override [1v3].games_per_iter')
+    parser.add_argument('--iters', type=int, help='override [1v3].iters')
+    return parser.parse_args()
+
+def static_glob_root(pattern):
+    abs_pattern = path.abspath(pattern)
+    parts = []
+    for part in abs_pattern.split(path.sep):
+        if any(char in part for char in '*?['):
+            break
+        parts.append(part)
+    if not parts:
+        return path.abspath(path.sep)
+    return path.normcase(path.normpath(path.sep.join(parts)))
+
+def is_within(child, parent):
+    child = path.normcase(path.abspath(child))
+    parent = path.normcase(path.abspath(parent))
+    try:
+        return path.commonpath([child, parent]) == parent
+    except ValueError:
+        return False
+
+def log_dir_overlaps_dataset(log_dir):
+    log_dir = path.abspath(log_dir)
+    return any(
+        is_within(log_dir, static_glob_root(pattern))
+        for pattern in config['dataset']['globs']
+    )
+
 def main():
+    args = parse_args()
     cfg = config['1v3']
-    games_per_iter = cfg['games_per_iter']
+    mode = args.mode or cfg.get('mode', 'eval')
+    if mode not in ('eval', 'train-data'):
+        raise ValueError(f'Unexpected [1v3].mode {mode}')
+
+    games_per_iter = args.games or cfg['games_per_iter']
     seeds_per_iter = games_per_iter // 4
-    iters = cfg['iters']
-    log_dir = cfg['log_dir']
+    iters = args.iters or cfg['iters']
+    if args.log_dir:
+        log_dir = args.log_dir
+    elif mode == 'eval':
+        log_dir = cfg.get('eval_log_dir', 'local_logs/1v3_eval')
+    else:
+        log_dir = cfg['log_dir']
+
+    if games_per_iter % 4 != 0:
+        raise ValueError('games_per_iter must be divisible by 4')
+    if mode == 'eval' and log_dir_overlaps_dataset(log_dir):
+        raise RuntimeError(
+            f'eval log_dir {log_dir!r} overlaps dataset.globs; '
+            'use a directory outside the training data glob or run with --mode train-data intentionally'
+        )
+
+    print(f'mode: {mode}')
+    print(f'log_dir: {path.abspath(log_dir)}')
     use_akochan = cfg['akochan']['enabled']
 
     if (key := cfg.get('seed_key', -1)) == -1:
@@ -24,13 +87,13 @@ def main():
         os.environ['AKOCHAN_DIR'] = cfg['akochan']['dir']
         os.environ['AKOCHAN_TACTICS'] = cfg['akochan']['tactics']
     else:
-        state = torch.load(cfg['champion']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+        state = load_torch_state(cfg['champion']['state_file'], map_location=torch.device('cpu'))
         cham_cfg = state['config']
         version = cham_cfg['control'].get('version', 1)
         conv_channels = cham_cfg['resnet']['conv_channels']
         num_blocks = cham_cfg['resnet']['num_blocks']
         mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        dqn = DQN(version=version).eval()
+        dqn = DQN(version=version, **cham_cfg.get('dqn', {})).eval()
         mortal.load_state_dict(state['mortal'])
         dqn.load_state_dict(state['current_dqn'])
         if cfg['champion']['enable_compile']:
@@ -47,13 +110,14 @@ def main():
             name = cfg['champion']['name'],
         )
 
-    state = torch.load(cfg['challenger']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+    challenger_state_file = args.challenger_state_file or cfg['challenger']['state_file']
+    state = load_torch_state(challenger_state_file, map_location=torch.device('cpu'))
     chal_cfg = state['config']
     version = chal_cfg['control'].get('version', 1)
     conv_channels = chal_cfg['resnet']['conv_channels']
     num_blocks = chal_cfg['resnet']['num_blocks']
     mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-    dqn = DQN(version=version).eval()
+    dqn = DQN(version=version, **chal_cfg.get('dqn', {})).eval()
     mortal.load_state_dict(state['mortal'])
     dqn.load_state_dict(state['current_dqn'])
     if cfg['challenger']['enable_compile']:

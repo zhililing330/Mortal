@@ -7,7 +7,7 @@ import torch
 from datetime import datetime, timezone
 from model import Brain, DQN, GRP
 from engine import MortalEngine
-from common import filtered_trimmed_lines
+from common import filtered_trimmed_lines, load_torch_state
 from libriichi.mjai import Bot
 from libriichi.dataset import Grp
 from config import config
@@ -27,7 +27,7 @@ def main():
     review_mode = os.environ.get('MORTAL_REVIEW_MODE', '0') == '1'
 
     device = torch.device('cpu')
-    state = torch.load(config['control']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+    state = load_torch_state(config['control']['state_file'], map_location=torch.device('cpu'))
     cfg = state['config']
     version = cfg['control'].get('version', 1)
     num_blocks = cfg['resnet']['num_blocks']
@@ -39,7 +39,7 @@ def main():
         tag = f'mortal{version}-b{num_blocks}c{conv_channels}-t{time}'
 
     mortal = Brain(version=version, num_blocks=num_blocks, conv_channels=conv_channels).eval()
-    dqn = DQN(version=version).eval()
+    dqn = DQN(version=version, **cfg.get('dqn', {})).eval()
     mortal.load_state_dict(state['mortal'])
     dqn.load_state_dict(state['current_dqn'])
 
@@ -69,7 +69,7 @@ def main():
 
     if review_mode:
         grp = GRP(**config['grp']['network'])
-        grp_state = torch.load(config['grp']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+        grp_state = load_torch_state(config['grp']['state_file'], map_location=torch.device('cpu'))
         grp.load_state_dict(grp_state['model'])
 
         ins = Grp.load_log('\n'.join(logs))

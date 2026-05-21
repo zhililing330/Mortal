@@ -2,6 +2,8 @@ import torch
 import socket
 import struct
 import time
+import pickle
+import logging
 from typing import *
 from io import BytesIO
 from functools import partial
@@ -12,6 +14,18 @@ tqdm = partial(orig_tqdm, unit='batch', dynamic_ncols=True, ascii=True)
 
 def parameter_count(module):
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+def load_torch_state(filename, *, map_location=None, weights_only=True):
+    try:
+        return torch.load(filename, weights_only=weights_only, map_location=map_location)
+    except pickle.UnpicklingError:
+        if not weights_only:
+            raise
+        logging.warning(
+            'falling back to weights_only=False for trusted local checkpoint: %s',
+            filename,
+        )
+        return torch.load(filename, weights_only=False, map_location=map_location)
 
 def filtered_trimmed_lines(lines):
     return filter(lambda l: l, map(lambda l: l.strip(), lines))

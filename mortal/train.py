@@ -19,7 +19,7 @@ def train():
     from torch.nn.utils import clip_grad_norm_
     from torch.utils.data import DataLoader
     from torch.utils.tensorboard import SummaryWriter
-    from common import submit_param, parameter_count, drain, filtered_trimmed_lines, tqdm
+    from common import submit_param, parameter_count, drain, filtered_trimmed_lines, load_torch_state, tqdm
     from player import TestPlayer
     from dataloader import FileDatasetsIter, worker_init_fn
     from lr_scheduler import LinearWarmUpCosineAnnealingLR
@@ -35,33 +35,91 @@ def train():
     save_every = config['control']['save_every']
     test_every = config['control']['test_every']
     submit_every = config['control']['submit_every']
+    max_train_steps_per_run = config['control'].get('max_train_steps_per_run', 0)
     test_games = config['test_play']['games']
     min_q_weight = config['cql']['min_q_weight']
     next_rank_weight = config['aux']['next_rank_weight']
     assert save_every % opt_step_every == 0
     assert test_every % save_every == 0
+    if max_train_steps_per_run < 0:
+        raise ValueError('max_train_steps_per_run must be non-negative')
 
     device = torch.device(config['control']['device'])
     torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
     enable_amp = config['control']['enable_amp']
     enable_compile = config['control']['enable_compile']
+    reset_optimizer_on_load = config['control'].get('reset_optimizer_on_load', False)
+    reset_scaler_on_load = config['control'].get('reset_scaler_on_load', False)
+    reset_steps_on_load = config['control'].get('reset_steps_on_load', False)
 
     pts = config['env']['pts']
     gamma = config['env']['gamma']
     file_batch_size = config['dataset']['file_batch_size']
+    rebuild_file_index = config['dataset'].get('rebuild_file_index', False)
     reserve_ratio = config['dataset']['reserve_ratio']
     num_workers = config['dataset']['num_workers']
     num_epochs = config['dataset']['num_epochs']
     enable_augmentation = config['dataset']['enable_augmentation']
     augmented_first = config['dataset']['augmented_first']
+    modified_after = config['dataset'].get('modified_after')
+    modified_after_ts = None
+    if modified_after:
+        modified_after_ts = datetime.fromisoformat(str(modified_after)).timestamp()
     eps = config['optim']['eps']
     betas = config['optim']['betas']
     weight_decay = config['optim']['weight_decay']
     max_grad_norm = config['optim']['max_grad_norm']
+    freeze_params_config = config.get('freeze_params', {})
+    freeze_mortal_params = freeze_params_config.get('mortal', False)
+    dqn_config = config.get('dqn', {})
+    loss_config = config.get('loss', {})
+    q_loss_name = loss_config.get('q_loss', 'mse').lower()
+    huber_delta = loss_config.get('huber_delta', 1.0)
+    bc_weight = loss_config.get('bc_weight', loss_config.get('behavior_clone_weight', 0.))
+    bc_temperature = loss_config.get('bc_temperature', 1.0)
+    if q_loss_name not in ('mse', 'huber'):
+        raise ValueError(f'Unexpected q_loss {q_loss_name}')
+    if bc_weight < 0:
+        raise ValueError('bc_weight must be non-negative')
+    if bc_temperature <= 0:
+        raise ValueError('bc_temperature must be positive')
+    adaptive_config = config.get('adaptive', {})
+    adaptive_enabled = adaptive_config.get('enabled', False)
+    adaptive_reset_state_on_load = adaptive_config.get('reset_state_on_load', False)
+    candidate_enabled = adaptive_config.get('candidate_enabled', adaptive_enabled)
+    candidate_min_avg_pt = adaptive_config.get('candidate_min_avg_pt', 0.5)
+    candidate_max_avg_rank = adaptive_config.get('candidate_max_avg_rank', 2.5)
+    confirm_games = adaptive_config.get('confirm_games', 0)
+    confirm_min_avg_pt = adaptive_config.get('confirm_min_avg_pt', 1.0)
+    confirm_max_avg_rank = adaptive_config.get('confirm_max_avg_rank', 2.49)
+    adaptive_metric = adaptive_config.get('metric', 'joint').lower()
+    adaptive_patience = adaptive_config.get('patience', 2)
+    adaptive_lr_factor = adaptive_config.get('lr_factor', 0.5)
+    adaptive_min_lr = adaptive_config.get('min_lr', 2e-5)
+    adaptive_min_delta_pt = adaptive_config.get('min_delta_pt', 1.0)
+    adaptive_min_delta_rank = adaptive_config.get('min_delta_rank', 0.01)
+    adaptive_stop_after_lr_floor_patience = adaptive_config.get('stop_after_lr_floor_patience', 3)
+    if adaptive_enabled:
+        if adaptive_metric not in ('joint', 'avg_pt', 'avg_rank'):
+            raise ValueError(f'Unexpected adaptive metric {adaptive_metric}')
+        if adaptive_patience < 1:
+            raise ValueError('adaptive patience must be positive')
+        if not 0 < adaptive_lr_factor < 1:
+            raise ValueError('adaptive lr_factor must be in (0, 1)')
+        if adaptive_min_lr < 0:
+            raise ValueError('adaptive min_lr must be non-negative')
+        if adaptive_stop_after_lr_floor_patience < 0:
+            raise ValueError('adaptive stop_after_lr_floor_patience must be non-negative')
+    if candidate_enabled:
+        if confirm_games < 0 or confirm_games % 4 != 0:
+            raise ValueError('adaptive confirm_games must be non-negative and divisible by 4')
 
     mortal = Brain(version=version, **config['resnet']).to(device)
-    dqn = DQN(version=version).to(device)
+    dqn = DQN(version=version, **dqn_config).to(device)
     aux_net = AuxNet((4,)).to(device)
+    if freeze_mortal_params:
+        for p in mortal.parameters():
+            p.requires_grad_(False)
     all_models = (mortal, dqn, aux_net)
     if enable_compile:
         for m in all_models:
@@ -69,11 +127,32 @@ def train():
 
     logging.info(f'version: {version}')
     logging.info(f'obs shape: {obs_shape(version)}')
+    logging.info(f'dqn config: {dqn_config or {"head": "legacy"}}')
+    logging.info(f'q loss: {q_loss_name}' + (f' (delta={huber_delta})' if q_loss_name == 'huber' else ''))
+    if bc_weight > 0:
+        logging.info(f'bc loss: weight={bc_weight}, temperature={bc_temperature}')
+    if modified_after_ts is not None:
+        logging.info(f'dataset modified_after: {modified_after}')
+    if freeze_mortal_params:
+        logging.info('mortal backbone params are frozen')
+    if adaptive_enabled:
+        logging.info(
+            'adaptive: '
+            f'metric={adaptive_metric}, patience={adaptive_patience}, '
+            f'lr_factor={adaptive_lr_factor}, min_lr={adaptive_min_lr}'
+        )
+    if candidate_enabled:
+        logging.info(
+            'candidate: '
+            f'quick rank<={candidate_max_avg_rank}, quick pt>={candidate_min_avg_pt}, '
+            f'confirm_games={confirm_games}, '
+            f'confirm rank<={confirm_max_avg_rank}, confirm pt>={confirm_min_avg_pt}'
+        )
     logging.info(f'mortal params: {parameter_count(mortal):,}')
     logging.info(f'dqn params: {parameter_count(dqn):,}')
     logging.info(f'aux params: {parameter_count(aux_net):,}')
 
-    mortal.freeze_bn(config['freeze_bn']['mortal'])
+    mortal.freeze_bn(config['freeze_bn']['mortal'] or freeze_mortal_params)
 
     decay_params = []
     no_decay_params = []
@@ -82,6 +161,8 @@ def train():
         to_decay = set()
         for mod_name, mod in model.named_modules():
             for name, param in mod.named_parameters(prefix=mod_name, recurse=False):
+                if not param.requires_grad:
+                    continue
                 params_dict[name] = param
                 if isinstance(mod, (nn.Linear, nn.Conv1d)) and name.endswith('weight'):
                     to_decay.add(name)
@@ -99,26 +180,61 @@ def train():
         'avg_rank': 4.,
         'avg_pt': -135.,
     }
+    adaptive_perf = {
+        'avg_rank': 4.,
+        'avg_pt': -135.,
+    }
+    adaptive_state = {
+        'bad_tests': 0,
+        'floor_bad_tests': 0,
+        'lr_reductions': 0,
+    }
+    candidate_perf = None
+    adaptive_stop_requested = False
 
     steps = 0
     state_file = config['control']['state_file']
     best_state_file = config['control']['best_state_file']
+    candidate_state_file = config['control'].get('candidate_state_file')
     if path.exists(state_file):
-        state = torch.load(state_file, weights_only=True, map_location=device)
+        state = load_torch_state(state_file, map_location=device)
         timestamp = datetime.fromtimestamp(state['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f'loaded: {timestamp}')
         mortal.load_state_dict(state['mortal'])
         dqn.load_state_dict(state['current_dqn'])
         aux_net.load_state_dict(state['aux_net'])
-        if not online or state['config']['control']['online']:
+        if reset_optimizer_on_load:
+            logging.info('reset optimizer and scheduler state on load')
+        elif not online or state['config']['control']['online']:
             optimizer.load_state_dict(state['optimizer'])
             scheduler.load_state_dict(state['scheduler'])
-        scaler.load_state_dict(state['scaler'])
+        scaler_state = state.get('scaler')
+        if reset_scaler_on_load:
+            logging.info('reset GradScaler state on load')
+        elif scaler_state:
+            scaler.load_state_dict(scaler_state)
+        else:
+            logging.info('skipped loading empty GradScaler state')
         best_perf = state['best_perf']
-        steps = state['steps']
+        if adaptive_reset_state_on_load:
+            logging.info('reset adaptive state on load')
+            candidate_perf = None
+        else:
+            adaptive_state.update(state.get('adaptive_state', {}))
+            adaptive_perf.update(state.get('adaptive_perf', {}))
+            candidate_perf = state.get('candidate_perf')
+        if reset_steps_on_load:
+            logging.info(f'reset steps on load: {state["steps"]:,} -> 0')
+            steps = 0
+        else:
+            steps = state['steps']
+    run_start_steps = steps
 
     optimizer.zero_grad(set_to_none=True)
-    mse = nn.MSELoss()
+    if q_loss_name == 'mse':
+        q_loss_fn = nn.MSELoss()
+    else:
+        q_loss_fn = nn.HuberLoss(delta=huber_delta)
     ce = nn.CrossEntropyLoss()
 
     if device.type == 'cuda':
@@ -134,7 +250,18 @@ def train():
     stats = {
         'dqn_loss': 0,
         'cql_loss': 0,
+        'cql_weighted_loss': 0,
+        'cql_logsumexp': 0,
+        'cql_data_q': 0,
         'next_rank_loss': 0,
+        'bc_loss': 0,
+        'q_selected': 0,
+        'q_target': 0,
+        'q_legal_mean': 0,
+        'q_legal_max': 0,
+        'q_legal_min': 0,
+        'q_error': 0,
+        'q_abs_error': 0,
     }
     all_q = torch.zeros((save_every, batch_size), device=device, dtype=torch.float32)
     all_q_target = torch.zeros((save_every, batch_size), device=device, dtype=torch.float32)
@@ -143,6 +270,18 @@ def train():
     def train_epoch():
         nonlocal steps
         nonlocal idx
+        nonlocal adaptive_stop_requested
+
+        def filter_file_list(file_list):
+            if modified_after_ts is None:
+                return file_list
+            before_count = len(file_list)
+            file_list = [filename for filename in file_list if path.getmtime(filename) >= modified_after_ts]
+            logging.info(
+                'filtered file list by modified_after: '
+                f'{before_count:,} -> {len(file_list):,}'
+            )
+            return file_list
 
         player_names = []
         if online:
@@ -158,14 +297,15 @@ def train():
             logging.info(f'loaded {len(player_names):,} players')
 
             file_index = config['dataset']['file_index']
-            if path.exists(file_index):
+            if path.exists(file_index) and not rebuild_file_index:
                 index = torch.load(file_index, weights_only=True)
-                file_list = index['file_list']
+                file_list = filter_file_list(index['file_list'])
             else:
                 logging.info('building file index...')
                 file_list = []
                 for pat in config['dataset']['globs']:
                     file_list.extend(glob(pat, recursive=True))
+                file_list = filter_file_list(file_list)
                 if len(player_names_set) > 0:
                     filtered = []
                     for filename in tqdm(file_list, unit='file'):
@@ -212,7 +352,353 @@ def train():
         remaining_bs = 0
         pb = tqdm(total=save_every, desc='TRAIN', initial=steps % save_every)
 
+        def optimizer_step():
+            if max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
+                clip_grad_norm_(params, max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        def clamp_optimizer_lr_floor():
+            if not adaptive_enabled or adaptive_min_lr <= 0:
+                return
+            for group in optimizer.param_groups:
+                if group['lr'] < adaptive_min_lr:
+                    group['lr'] = adaptive_min_lr
+            if hasattr(scheduler, '_last_lr'):
+                scheduler._last_lr = [group['lr'] for group in optimizer.param_groups]
+
+        def save_checkpoint():
+            state = {
+                'mortal': mortal.state_dict(),
+                'current_dqn': dqn.state_dict(),
+                'aux_net': aux_net.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'steps': steps,
+                'timestamp': datetime.now().timestamp(),
+                'best_perf': best_perf,
+                'candidate_perf': candidate_perf,
+                'adaptive_state': adaptive_state,
+                'adaptive_perf': adaptive_perf,
+                'config': config,
+            }
+            torch.save(state, state_file)
+            return state
+
+        def reset_train_stats():
+            nonlocal idx
+
+            for k in stats:
+                stats[k] = 0
+            idx = 0
+
+        def write_train_stats(divisor):
+            # downsample to reduce tensorboard event size
+            all_q_1d = all_q[:divisor].cpu().numpy().flatten()[::128]
+            all_q_target_1d = all_q_target[:divisor].cpu().numpy().flatten()[::128]
+
+            writer.add_scalar('loss/dqn_loss', stats['dqn_loss'] / divisor, steps)
+            if not online:
+                writer.add_scalar('loss/cql_loss', stats['cql_loss'] / divisor, steps)
+                writer.add_scalars('cql/components', {
+                    'loss': stats['cql_loss'] / divisor,
+                    'weighted_loss': stats['cql_weighted_loss'] / divisor,
+                    'logsumexp': stats['cql_logsumexp'] / divisor,
+                    'data_q': stats['cql_data_q'] / divisor,
+                }, steps)
+            if bc_weight > 0:
+                writer.add_scalar('loss/bc_loss', stats['bc_loss'] / divisor, steps)
+            writer.add_scalar('loss/next_rank_loss', stats['next_rank_loss'] / divisor, steps)
+            writer.add_scalar('hparam/lr', optimizer.param_groups[0]['lr'], steps)
+            writer.add_scalar('train/save_batches', divisor, steps)
+            writer.add_scalars('q/value', {
+                'selected': stats['q_selected'] / divisor,
+                'target': stats['q_target'] / divisor,
+                'legal_mean': stats['q_legal_mean'] / divisor,
+                'legal_max': stats['q_legal_max'] / divisor,
+                'legal_min': stats['q_legal_min'] / divisor,
+            }, steps)
+            writer.add_scalars('q/error', {
+                'signed': stats['q_error'] / divisor,
+                'absolute': stats['q_abs_error'] / divisor,
+            }, steps)
+            writer.add_histogram('q_predicted', all_q_1d, steps)
+            writer.add_histogram('q_target', all_q_target_1d, steps)
+            writer.flush()
+
+        def adaptive_has_progress(avg_pt, avg_rank, past_perf, better):
+            if better:
+                return True
+            if adaptive_metric == 'avg_pt':
+                return avg_pt >= past_perf['avg_pt'] + adaptive_min_delta_pt
+            if adaptive_metric == 'avg_rank':
+                return avg_rank <= past_perf['avg_rank'] - adaptive_min_delta_rank
+            return (
+                avg_pt >= past_perf['avg_pt'] + adaptive_min_delta_pt
+                and avg_rank <= past_perf['avg_rank'] + adaptive_min_delta_rank
+            )
+
+        def candidate_quick_pass(avg_pt, avg_rank):
+            return (
+                candidate_enabled
+                and avg_pt >= candidate_min_avg_pt
+                and avg_rank <= candidate_max_avg_rank
+            )
+
+        def candidate_confirm_pass(avg_pt, avg_rank):
+            return (
+                avg_pt >= confirm_min_avg_pt
+                and avg_rank <= confirm_max_avg_rank
+            )
+
+        def adaptive_lr_at_floor():
+            if adaptive_min_lr <= 0:
+                return False
+            return all(group['lr'] <= adaptive_min_lr * 1.000001 for group in optimizer.param_groups)
+
+        def adaptive_reduce_lr():
+            current_lrs = [group['lr'] for group in optimizer.param_groups]
+            target_lrs = [
+                max(lr * adaptive_lr_factor, adaptive_min_lr)
+                for lr in current_lrs
+            ]
+            for group, target_lr in zip(optimizer.param_groups, target_lrs):
+                group['lr'] = target_lr
+            if hasattr(scheduler, 'base_lrs'):
+                scheduler.base_lrs = [
+                    base_lr * (target_lrs[i] / current_lrs[i] if current_lrs[i] > 0 else 1.)
+                    for i, base_lr in enumerate(scheduler.base_lrs)
+                ]
+            if hasattr(scheduler, '_last_lr'):
+                scheduler._last_lr = target_lrs
+            adaptive_state['lr_reductions'] += 1
+            logging.info(
+                'adaptive reduced lr: '
+                + ', '.join(
+                    f'{old:.6g}->{new:.6g}'
+                    for old, new in zip(current_lrs, target_lrs)
+                )
+            )
+
+        def evaluate_after_save():
+            nonlocal adaptive_stop_requested
+            nonlocal candidate_perf
+
+            if steps % test_every != 0:
+                return
+
+            stat = test_player.test_play(test_games // 4, mortal, dqn, device)
+            mortal.train()
+            dqn.train()
+
+            avg_pt = stat.avg_pt([90, 45, 0, -135]) # for display only, never used in training
+            past_best = best_perf.copy()
+            past_adaptive_perf = adaptive_perf.copy()
+            promoted = False
+            quick_candidate = candidate_quick_pass(avg_pt, stat.avg_rank)
+
+            logging.info(f'avg rank: {stat.avg_rank:.6}')
+            logging.info(f'avg pt: {avg_pt:.6}')
+            writer.add_scalar('test_play/avg_ranking', stat.avg_rank, steps)
+            writer.add_scalar('test_play/avg_pt', avg_pt, steps)
+            writer.add_scalars('test_play/ranking', {
+                '1st': stat.rank_1_rate,
+                '2nd': stat.rank_2_rate,
+                '3rd': stat.rank_3_rate,
+                '4th': stat.rank_4_rate,
+            }, steps)
+            writer.add_scalars('test_play/behavior', {
+                'agari': stat.agari_rate,
+                'houjuu': stat.houjuu_rate,
+                'fuuro': stat.fuuro_rate,
+                'riichi': stat.riichi_rate,
+            }, steps)
+            writer.add_scalars('test_play/agari_point', {
+                'overall': stat.avg_point_per_agari,
+                'riichi': stat.avg_point_per_riichi_agari,
+                'fuuro': stat.avg_point_per_fuuro_agari,
+                'dama': stat.avg_point_per_dama_agari,
+            }, steps)
+            writer.add_scalar('test_play/houjuu_point', stat.avg_point_per_houjuu, steps)
+            writer.add_scalar('test_play/point_per_round', stat.avg_point_per_round, steps)
+            writer.add_scalars('test_play/key_step', {
+                'agari_jun': stat.avg_agari_jun,
+                'houjuu_jun': stat.avg_houjuu_jun,
+                'riichi_jun': stat.avg_riichi_jun,
+            }, steps)
+            writer.add_scalars('test_play/riichi', {
+                'agari_after_riichi': stat.agari_rate_after_riichi,
+                'houjuu_after_riichi': stat.houjuu_rate_after_riichi,
+                'chasing_riichi': stat.chasing_riichi_rate,
+                'riichi_chased': stat.riichi_chased_rate,
+            }, steps)
+            writer.add_scalar('test_play/riichi_point', stat.avg_riichi_point, steps)
+            writer.add_scalars('test_play/fuuro', {
+                'agari_after_fuuro': stat.agari_rate_after_fuuro,
+                'houjuu_after_fuuro': stat.houjuu_rate_after_fuuro,
+            }, steps)
+            writer.add_scalar('test_play/fuuro_num', stat.avg_fuuro_num, steps)
+            writer.add_scalar('test_play/fuuro_point', stat.avg_fuuro_point, steps)
+            writer.flush()
+
+            if quick_candidate:
+                candidate_perf = {
+                    'steps': steps,
+                    'quick_avg_rank': stat.avg_rank,
+                    'quick_avg_pt': avg_pt,
+                }
+                save_checkpoint()
+                if candidate_state_file:
+                    shutil.copy(state_file, candidate_state_file)
+                logging.info(
+                    'candidate saved, '
+                    f'quick pt: {avg_pt:.4}, rank: {stat.avg_rank:.4}'
+                )
+                writer.add_scalar('candidate/quick_avg_ranking', stat.avg_rank, steps)
+                writer.add_scalar('candidate/quick_avg_pt', avg_pt, steps)
+                writer.flush()
+
+                if confirm_games > 0:
+                    logging.info(f'confirming candidate with {confirm_games:,} hanchans')
+                    confirm_stat = test_player.test_play(confirm_games // 4, mortal, dqn, device)
+                    mortal.train()
+                    dqn.train()
+                    confirm_avg_pt = confirm_stat.avg_pt([90, 45, 0, -135])
+                    candidate_perf.update({
+                        'confirm_games': confirm_games,
+                        'confirm_avg_rank': confirm_stat.avg_rank,
+                        'confirm_avg_pt': confirm_avg_pt,
+                    })
+                    logging.info(f'confirm avg rank: {confirm_stat.avg_rank:.6}')
+                    logging.info(f'confirm avg pt: {confirm_avg_pt:.6}')
+                    writer.add_scalar('confirm_play/avg_ranking', confirm_stat.avg_rank, steps)
+                    writer.add_scalar('confirm_play/avg_pt', confirm_avg_pt, steps)
+                    writer.add_scalars('confirm_play/ranking', {
+                        '1st': confirm_stat.rank_1_rate,
+                        '2nd': confirm_stat.rank_2_rate,
+                        '3rd': confirm_stat.rank_3_rate,
+                        '4th': confirm_stat.rank_4_rate,
+                    }, steps)
+                    writer.flush()
+
+                    if candidate_confirm_pass(confirm_avg_pt, confirm_stat.avg_rank):
+                        best_perf['avg_pt'] = confirm_avg_pt
+                        best_perf['avg_rank'] = confirm_stat.avg_rank
+                        promoted = True
+                        save_checkpoint()
+                        shutil.copy(state_file, best_state_file)
+                        logging.info(
+                            'candidate confirmed and promoted, '
+                            f'pt: {past_best["avg_pt"]:.4} -> {best_perf["avg_pt"]:.4}, '
+                            f'rank: {past_best["avg_rank"]:.4} -> {best_perf["avg_rank"]:.4}, '
+                            f'saving to {best_state_file}'
+                        )
+                    else:
+                        save_checkpoint()
+                        logging.info(
+                            'candidate rejected by confirmation, '
+                            f'pt: {confirm_avg_pt:.4}, rank: {confirm_stat.avg_rank:.4}'
+                        )
+                else:
+                    logging.info('candidate confirmation is disabled; best was not promoted')
+            elif candidate_enabled:
+                logging.info(
+                    'candidate quick gate not passed: '
+                    f'pt {avg_pt:.4} / {candidate_min_avg_pt:.4}, '
+                    f'rank {stat.avg_rank:.4} / {candidate_max_avg_rank:.4}'
+                )
+
+            if adaptive_enabled:
+                if adaptive_has_progress(avg_pt, stat.avg_rank, past_adaptive_perf, promoted):
+                    adaptive_perf['avg_pt'] = avg_pt
+                    adaptive_perf['avg_rank'] = stat.avg_rank
+                    adaptive_state['bad_tests'] = 0
+                    adaptive_state['floor_bad_tests'] = 0
+                    logging.info(
+                        'adaptive progress: '
+                        f'pt: {past_adaptive_perf["avg_pt"]:.4} -> {adaptive_perf["avg_pt"]:.4}, '
+                        f'rank: {past_adaptive_perf["avg_rank"]:.4} -> {adaptive_perf["avg_rank"]:.4}'
+                    )
+                else:
+                    adaptive_state['bad_tests'] += 1
+                    logging.info(
+                        'adaptive no progress: '
+                        f'{adaptive_state["bad_tests"]}/{adaptive_patience}'
+                    )
+                    if adaptive_state['bad_tests'] >= adaptive_patience:
+                        if adaptive_lr_at_floor():
+                            adaptive_state['bad_tests'] = 0
+                            adaptive_state['floor_bad_tests'] += 1
+                            logging.info(
+                                'adaptive lr is already at floor: '
+                                f'{adaptive_state["floor_bad_tests"]}/'
+                                f'{adaptive_stop_after_lr_floor_patience}'
+                            )
+                            if (
+                                adaptive_stop_after_lr_floor_patience > 0
+                                and adaptive_state['floor_bad_tests'] >= adaptive_stop_after_lr_floor_patience
+                            ):
+                                adaptive_stop_requested = True
+                                logging.info('adaptive requested stopping this training run')
+                        else:
+                            adaptive_reduce_lr()
+                            adaptive_state['bad_tests'] = 0
+                            adaptive_state['floor_bad_tests'] = 0
+                writer.add_scalar('adaptive/bad_tests', adaptive_state['bad_tests'], steps)
+                writer.add_scalar('adaptive/floor_bad_tests', adaptive_state['floor_bad_tests'], steps)
+                writer.add_scalar('adaptive/lr_reductions', adaptive_state['lr_reductions'], steps)
+                writer.add_scalar('adaptive/lr', optimizer.param_groups[0]['lr'], steps)
+                writer.add_scalar('adaptive/best_quick_avg_pt', adaptive_perf['avg_pt'], steps)
+                writer.add_scalar('adaptive/best_quick_avg_ranking', adaptive_perf['avg_rank'], steps)
+                writer.flush()
+                save_checkpoint()
+
+            if online:
+                # BUG: This is a bug with unknown reason. When training
+                # in online mode, the process will get stuck here. This
+                # is the reason why `main` spawns a sub process to train
+                # in online mode instead of going for training directly.
+                sys.exit(0)
+
+        def save_progress(final=False):
+            nonlocal idx
+            nonlocal pb
+
+            divisor = idx
+            if divisor <= 0:
+                pb.close()
+                if final:
+                    save_checkpoint()
+                return
+
+            if idx % opt_step_every != 0:
+                optimizer_step()
+            pb.close()
+
+            write_train_stats(divisor)
+            reset_train_stats()
+
+            before_next_test_play = (test_every - steps % test_every) % test_every
+            if final and divisor != save_every:
+                logging.info(f'final partial checkpoint: {divisor:,}/{save_every:,} batches')
+            logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
+
+            save_checkpoint()
+
+            if online and steps % submit_every != 0:
+                submit_param(mortal, dqn, is_idle=False)
+                logging.info('param has been submitted')
+
+            evaluate_after_save()
+            if not final and not adaptive_stop_requested:
+                pb = tqdm(total=save_every, desc='TRAIN')
+
         def train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks):
+            nonlocal adaptive_stop_requested
             nonlocal steps
             nonlocal idx
             nonlocal pb
@@ -232,10 +718,18 @@ def train():
                 phi = mortal(obs)
                 q_out = dqn(phi, masks)
                 q = q_out[range(batch_size), actions]
-                dqn_loss = 0.5 * mse(q, q_target_mc)
-                cql_loss = 0
+                if q_loss_name == 'mse':
+                    dqn_loss = 0.5 * q_loss_fn(q, q_target_mc)
+                else:
+                    dqn_loss = q_loss_fn(q, q_target_mc)
+                cql_logsumexp = q_out.logsumexp(-1).mean()
+                cql_data_q = q.mean()
+                cql_loss = q.new_zeros(())
                 if not online:
-                    cql_loss = q_out.logsumexp(-1).mean() - q.mean()
+                    cql_loss = cql_logsumexp - cql_data_q
+                bc_loss = q.new_zeros(())
+                if bc_weight > 0:
+                    bc_loss = ce(q_out / bc_temperature, actions)
 
                 next_rank_logits, = aux_net(phi)
                 next_rank_loss = ce(next_rank_logits, player_ranks)
@@ -243,6 +737,7 @@ def train():
                 loss = sum((
                     dqn_loss,
                     cql_loss * min_q_weight,
+                    bc_loss * bc_weight,
                     next_rank_loss * next_rank_weight,
                 ))
             scaler.scale(loss / opt_step_every).backward()
@@ -251,21 +746,32 @@ def train():
                 stats['dqn_loss'] += dqn_loss
                 if not online:
                     stats['cql_loss'] += cql_loss
+                    stats['cql_weighted_loss'] += cql_loss * min_q_weight
+                    stats['cql_logsumexp'] += cql_logsumexp
+                    stats['cql_data_q'] += cql_data_q
+                stats['bc_loss'] += bc_loss
                 stats['next_rank_loss'] += next_rank_loss
+                legal_q_sum = q_out.masked_fill(~masks, 0.).sum(-1)
+                legal_q_count = masks.sum(-1)
+                legal_q_mean = legal_q_sum / legal_q_count
+                legal_q_min = q_out.masked_fill(~masks, torch.inf).min(-1).values
+                q_error = q - q_target_mc
+                stats['q_selected'] += q.mean()
+                stats['q_target'] += q_target_mc.mean()
+                stats['q_legal_mean'] += legal_q_mean.mean()
+                stats['q_legal_max'] += q_out.max(-1).values.mean()
+                stats['q_legal_min'] += legal_q_min.mean()
+                stats['q_error'] += q_error.mean()
+                stats['q_abs_error'] += q_error.abs().mean()
                 all_q[idx] = q
                 all_q_target[idx] = q_target_mc
 
             steps += 1
             idx += 1
             if idx % opt_step_every == 0:
-                if max_grad_norm > 0:
-                    scaler.unscale_(optimizer)
-                    params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
-                    clip_grad_norm_(params, max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer_step()
             scheduler.step()
+            clamp_optimizer_lr_floor()
             pb.update(1)
 
             if online and steps % submit_every == 0:
@@ -273,120 +779,17 @@ def train():
                 logging.info('param has been submitted')
 
             if steps % save_every == 0:
-                pb.close()
-
-                # downsample to reduce tensorboard event size
-                all_q_1d = all_q.cpu().numpy().flatten()[::128]
-                all_q_target_1d = all_q_target.cpu().numpy().flatten()[::128]
-
-                writer.add_scalar('loss/dqn_loss', stats['dqn_loss'] / save_every, steps)
-                if not online:
-                    writer.add_scalar('loss/cql_loss', stats['cql_loss'] / save_every, steps)
-                writer.add_scalar('loss/next_rank_loss', stats['next_rank_loss'] / save_every, steps)
-                writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
-                writer.add_histogram('q_predicted', all_q_1d, steps)
-                writer.add_histogram('q_target', all_q_target_1d, steps)
-                writer.flush()
-
-                for k in stats:
-                    stats[k] = 0
-                idx = 0
-
-                before_next_test_play = (test_every - steps % test_every) % test_every
-                logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
-
-                state = {
-                    'mortal': mortal.state_dict(),
-                    'current_dqn': dqn.state_dict(),
-                    'aux_net': aux_net.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'steps': steps,
-                    'timestamp': datetime.now().timestamp(),
-                    'best_perf': best_perf,
-                    'config': config,
-                }
-                torch.save(state, state_file)
-
-                if online and steps % submit_every != 0:
-                    submit_param(mortal, dqn, is_idle=False)
-                    logging.info('param has been submitted')
-
-                if steps % test_every == 0:
-                    stat = test_player.test_play(test_games // 4, mortal, dqn, device)
-                    mortal.train()
-                    dqn.train()
-
-                    avg_pt = stat.avg_pt([90, 45, 0, -135]) # for display only, never used in training
-                    better = avg_pt >= best_perf['avg_pt'] and stat.avg_rank <= best_perf['avg_rank']
-                    if better:
-                        past_best = best_perf.copy()
-                        best_perf['avg_pt'] = avg_pt
-                        best_perf['avg_rank'] = stat.avg_rank
-
-                    logging.info(f'avg rank: {stat.avg_rank:.6}')
-                    logging.info(f'avg pt: {avg_pt:.6}')
-                    writer.add_scalar('test_play/avg_ranking', stat.avg_rank, steps)
-                    writer.add_scalar('test_play/avg_pt', avg_pt, steps)
-                    writer.add_scalars('test_play/ranking', {
-                        '1st': stat.rank_1_rate,
-                        '2nd': stat.rank_2_rate,
-                        '3rd': stat.rank_3_rate,
-                        '4th': stat.rank_4_rate,
-                    }, steps)
-                    writer.add_scalars('test_play/behavior', {
-                        'agari': stat.agari_rate,
-                        'houjuu': stat.houjuu_rate,
-                        'fuuro': stat.fuuro_rate,
-                        'riichi': stat.riichi_rate,
-                    }, steps)
-                    writer.add_scalars('test_play/agari_point', {
-                        'overall': stat.avg_point_per_agari,
-                        'riichi': stat.avg_point_per_riichi_agari,
-                        'fuuro': stat.avg_point_per_fuuro_agari,
-                        'dama': stat.avg_point_per_dama_agari,
-                    }, steps)
-                    writer.add_scalar('test_play/houjuu_point', stat.avg_point_per_houjuu, steps)
-                    writer.add_scalar('test_play/point_per_round', stat.avg_point_per_round, steps)
-                    writer.add_scalars('test_play/key_step', {
-                        'agari_jun': stat.avg_agari_jun,
-                        'houjuu_jun': stat.avg_houjuu_jun,
-                        'riichi_jun': stat.avg_riichi_jun,
-                    }, steps)
-                    writer.add_scalars('test_play/riichi', {
-                        'agari_after_riichi': stat.agari_rate_after_riichi,
-                        'houjuu_after_riichi': stat.houjuu_rate_after_riichi,
-                        'chasing_riichi': stat.chasing_riichi_rate,
-                        'riichi_chased': stat.riichi_chased_rate,
-                    }, steps)
-                    writer.add_scalar('test_play/riichi_point', stat.avg_riichi_point, steps)
-                    writer.add_scalars('test_play/fuuro', {
-                        'agari_after_fuuro': stat.agari_rate_after_fuuro,
-                        'houjuu_after_fuuro': stat.houjuu_rate_after_fuuro,
-                    }, steps)
-                    writer.add_scalar('test_play/fuuro_num', stat.avg_fuuro_num, steps)
-                    writer.add_scalar('test_play/fuuro_point', stat.avg_fuuro_point, steps)
-                    writer.flush()
-
-                    if better:
-                        torch.save(state, state_file)
-                        logging.info(
-                            'a new record has been made, '
-                            f'pt: {past_best["avg_pt"]:.4} -> {best_perf["avg_pt"]:.4}, '
-                            f'rank: {past_best["avg_rank"]:.4} -> {best_perf["avg_rank"]:.4}, '
-                            f'saving to {best_state_file}'
-                        )
-                        shutil.copy(state_file, best_state_file)
-                    if online:
-                        # BUG: This is a bug with unknown reason. When training
-                        # in online mode, the process will get stuck here. This
-                        # is the reason why `main` spawns a sub process to train
-                        # in online mode instead of going for training directly.
-                        sys.exit(0)
-                pb = tqdm(total=save_every, desc='TRAIN')
+                save_progress()
+            if max_train_steps_per_run > 0 and steps - run_start_steps >= max_train_steps_per_run:
+                adaptive_stop_requested = True
+                logging.info(
+                    'max_train_steps_per_run reached: '
+                    f'{steps - run_start_steps:,}/{max_train_steps_per_run:,}'
+                )
 
         for obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks in data_loader:
+            if adaptive_stop_requested:
+                break
             bs = obs.shape[0]
             if bs != batch_size:
                 remaining_obs.append(obs)
@@ -400,7 +803,7 @@ def train():
             train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks)
 
         remaining_batches = remaining_bs // batch_size
-        if remaining_batches > 0:
+        if remaining_batches > 0 and not adaptive_stop_requested:
             obs = torch.cat(remaining_obs, dim=0)
             actions = torch.cat(remaining_actions, dim=0)
             masks = torch.cat(remaining_masks, dim=0)
@@ -418,9 +821,14 @@ def train():
                     kyoku_rewards[start:end],
                     player_ranks[start:end],
                 )
+                if adaptive_stop_requested:
+                    break
                 start = end
                 end += batch_size
-        pb.close()
+        if idx > 0:
+            save_progress(final=True)
+        else:
+            pb.close()
 
         if online:
             submit_param(mortal, dqn, is_idle=True)
@@ -431,6 +839,8 @@ def train():
         gc.collect()
         # torch.cuda.empty_cache()
         # torch.cuda.synchronize()
+        if adaptive_stop_requested:
+            break
         if not online:
             # only run one epoch for offline for easier control
             break

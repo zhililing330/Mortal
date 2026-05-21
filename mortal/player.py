@@ -9,6 +9,7 @@ from model import Brain, DQN
 from engine import MortalEngine
 from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
+from common import load_torch_state
 from config import config
 
 class TestPlayer:
@@ -16,13 +17,13 @@ class TestPlayer:
         baseline_cfg = config['baseline']['test']
         device = torch.device(baseline_cfg['device'])
 
-        state = torch.load(baseline_cfg['state_file'], weights_only=True, map_location=torch.device('cpu'))
+        state = load_torch_state(baseline_cfg['state_file'], map_location=torch.device('cpu'))
         cfg = state['config']
         version = cfg['control'].get('version', 1)
         conv_channels = cfg['resnet']['conv_channels']
         num_blocks = cfg['resnet']['num_blocks']
         stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
+        stable_dqn = DQN(version=version, **cfg.get('dqn', {})).eval()
         stable_mortal.load_state_dict(state['mortal'])
         stable_dqn.load_state_dict(state['current_dqn'])
         if baseline_cfg['enable_compile']:
@@ -77,13 +78,13 @@ class TrainPlayer:
         baseline_cfg = config['baseline']['train']
         device = torch.device(baseline_cfg['device'])
 
-        state = torch.load(baseline_cfg['state_file'], weights_only=True, map_location=torch.device('cpu'))
+        state = load_torch_state(baseline_cfg['state_file'], map_location=torch.device('cpu'))
         cfg = state['config']
         version = cfg['control'].get('version', 1)
         conv_channels = cfg['resnet']['conv_channels']
         num_blocks = cfg['resnet']['num_blocks']
         stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
+        stable_dqn = DQN(version=version, **cfg.get('dqn', {})).eval()
         stable_mortal.load_state_dict(state['mortal'])
         stable_dqn.load_state_dict(state['current_dqn'])
         if baseline_cfg['enable_compile']:

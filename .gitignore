@@ -1,4 +1,5 @@
 .vscode
+.deepseek
 __pycache__
 
 /target
@@ -12,3 +13,8 @@ __pycache__
 *.ipynb
 
 /_draft
+
+# Local training/evaluation artifacts
+/mortal/local_logs
+/mortal/codex.md
+/mortal/player_names_mortal.txt

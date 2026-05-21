@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
 from model import GRP
 from libriichi.dataset import Grp
-from common import tqdm
+from common import load_torch_state, tqdm
 from config import config
 
 class GrpFileDatasetsIter(IterableDataset):
@@ -98,7 +98,7 @@ def train():
 
     state_file = cfg['state_file']
     if path.exists(state_file):
-        state = torch.load(state_file, weights_only=True, map_location=device)
+        state = load_torch_state(state_file, map_location=device)
         timestamp = datetime.fromtimestamp(state['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
         logging.info(f'loaded: {timestamp}')
         grp.load_state_dict(state['model'])
