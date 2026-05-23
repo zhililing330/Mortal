@@ -25,7 +25,7 @@ opt_step_every = 1
 save_every = 400
 test_every = 8000
 submit_every = 400
-max_train_steps_per_run = 42000
+max_train_steps_per_run = 85000
 
 [train_play.default]
 games = 800
@@ -117,7 +117,7 @@ max_grad_norm = 0
 peak = 8e-5
 final = 4e-5
 warm_up_steps = 1000
-max_steps = 40000
+max_steps = 80000
 
 [baseline.train]
 device = 'cuda:0'
