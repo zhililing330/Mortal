@@ -23,6 +23,9 @@ def parse_args():
     parser.add_argument('--challenger-state-file', help='override [1v3.challenger].state_file')
     parser.add_argument('--games', type=int, help='override [1v3].games_per_iter')
     parser.add_argument('--iters', type=int, help='override [1v3].iters')
+    parser.add_argument('--boltzmann-epsilon', type=float, help='override train-data challenger exploration epsilon')
+    parser.add_argument('--boltzmann-temp', type=float, help='override train-data challenger exploration temperature')
+    parser.add_argument('--top-p', type=float, help='override train-data challenger top-p sampling')
     return parser.parse_args()
 
 def static_glob_root(pattern):
@@ -75,9 +78,25 @@ def main():
             f'eval log_dir {log_dir!r} overlaps dataset.globs; '
             'use a directory outside the training data glob or run with --mode train-data intentionally'
         )
+    explore = mode == 'train-data'
+    boltzmann_epsilon = args.boltzmann_epsilon
+    if boltzmann_epsilon is None:
+        boltzmann_epsilon = cfg['challenger'].get('boltzmann_epsilon', 0.)
+    boltzmann_temp = args.boltzmann_temp
+    if boltzmann_temp is None:
+        boltzmann_temp = cfg['challenger'].get('boltzmann_temp', 1.)
+    top_p = args.top_p
+    if top_p is None:
+        top_p = cfg['challenger'].get('top_p', 1.)
+    if not explore:
+        boltzmann_epsilon = 0.
 
     print(f'mode: {mode}')
     print(f'log_dir: {path.abspath(log_dir)}')
+    print(
+        'challenger exploration: '
+        f'epsilon={boltzmann_epsilon}, temp={boltzmann_temp}, top_p={top_p}'
+    )
     use_akochan = cfg['akochan']['enabled']
 
     if (key := cfg.get('seed_key', -1)) == -1:
@@ -128,6 +147,9 @@ def main():
         dqn,
         is_oracle = False,
         version = version,
+        boltzmann_epsilon = boltzmann_epsilon,
+        boltzmann_temp = boltzmann_temp,
+        top_p = top_p,
         device = torch.device(cfg['challenger']['device']),
         enable_amp = cfg['challenger']['enable_amp'],
         enable_rule_based_agari_guard = cfg['challenger']['enable_rule_based_agari_guard'],

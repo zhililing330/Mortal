@@ -164,6 +164,9 @@ stochastic_latent = false
 enable_compile = false
 enable_amp = true
 enable_rule_based_agari_guard = true
+boltzmann_epsilon = 0.005
+boltzmann_temp = 0.05
+top_p = 1.0
 
 [1v3.champion]
 device = 'cuda:0'
